@@ -1,0 +1,460 @@
+// fin-blog — a markdown blog engine served over HTTP, in Fin (v0.1.0).
+//
+// The "full-stack" Fin demo: it composes four independently built and
+// verified libraries into one binary — zhttp (server), fin-markdown
+// (post rendering), fin-template (layout), finson (JSON meta API).
+// Posts are Markdown files with fin-ssg-style front matter, loaded once
+// at startup and rendered once; requests serve the stored HTML.
+//
+// Layout: <content>/layout.html, rendered with fin-template's tpl_render
+// compat shim ({{site_title}} {{title}} {{date}} {{content}}). The shim
+// auto-escapes {{title}}/{{date}} and passes {{content}} through |safe,
+// so callers pass RAW titles/dates and pre-rendered HTML bodies — do NOT
+// pre-escape titles here (fin-ssg double-escapes them; fin-blog does not).
+// If layout.html is missing, a built-in default layout is used.
+//
+// Routes (GET only; anything else -> 405):
+//   GET /               -> index: post list, newest first by date
+//   GET /post/<slug>    -> post page (404 HTML when the slug is unknown)
+//   GET /static/<name>  -> text file from <content>/static/ (css/js/txt/html
+//                          only, flat names — no "/" or ".." allowed)
+//   GET /api/posts      -> JSON [{slug, title, date}, ...] (finson)
+//   anything else       -> 404 HTML (404 JSON under /api/*)
+//
+// Error contract: the server never aborts on a request. Bad client input
+// (unknown slug, bad static name) gets a 4xx page; only programmer errors
+// (bind failure) go through zhttp's blame, as in fin-rest-todo.
+//
+// Usage: ./fin-blog [content_dir] [port] [site_title]
+//   Defaults: content_dir "content", port 8080, title "My Fin Blog".
+//   Port is argv[1] via /proc/self/cmdline (Linux-only, fin-ssg's recipe).
+//   Known stdlib caveat: Socket::serve lacks SO_REUSEADDR, so restarting
+//   on the SAME port within ~60s of serving a client fails to bind —
+//   the smoke test uses a fresh port per run to dodge it.
+//
+// Build (from the repo root; library dirs are sibling checkouts):
+//   finc -I <zhttp>/src -I <fin-template>/src -I <fin-markdown>/src \
+//        -I <finson>/src src/main.fin -o fin-blog
+
+import {
+    HttpRequest, HttpResponse, HttpReadResult, HttpServer, HttpConn,
+    http_listen, http_server_port, http_accept, http_read_request,
+    http_write_response, http_response_with_type,
+    http_free_response, http_free_read_result, http_close, http_server_close
+} from zhttp::fin;
+import {
+    JsonValue, json_object, json_array, json_array_push,
+    json_object_set, json_str, json_stringify, json_free
+} from finson::fin;
+import { md_to_html, md_escape_html } from markdown::fin;
+import { tpl_render } from template::fin;
+import { is_dir, is_file, read_to_string, free_file_content } from fs::std;
+import {
+    len, substr, concat, equals, compare, starts_with, ends_with, trim,
+    find, contains, index_of_char, is_numeric, parse_int, free_str,
+    from_chars, clone
+} from strings::std;
+
+// --- argv via Linux procfs (same recipe as fin-ssg / fin-rest-todo) -------
+#[llvm_name="open"]
+@define blog_open(path: string, flags: int) <int>;
+
+#[llvm_name="read"]
+@define blog_read(fd: int, buf: &char, count: ulong) <long>;
+
+#[llvm_name="close"]
+@define blog_close(fd: int) <int>;
+
+struct Argv { args <[string]>, count <int>, ok <bool> }
+
+fun read_argv() <Argv> {
+    let argv <Argv> = Argv{ args: new [string, 64]{}, count: 0, ok: false };
+    let buf <[char]> = new [char, 4096]{};
+    let fd <int> = blog_open("/proc/self/cmdline", 0);
+    if (fd < 0) { delete buf; return argv; }
+    let got <long> = blog_read(fd, &buf[0], cast<ulong>(4096));
+    blog_close(fd);
+    if (got <= cast<long>(0)) { delete buf; return argv; }
+    let end <int> = cast<int>(got);
+    let skip_first <bool> = true;
+    let start <int> = 0;
+    for (let i <int> = 0; i < end; i++) {
+        if (buf[i] == cast<char>(0)) {
+            if (i > start) {
+                if (skip_first) {
+                    skip_first = false;
+                } else if (argv.count < 64) {
+                    argv.args[argv.count] = from_chars(buf, start, i - start);
+                    argv.count = argv.count + 1;
+                }
+            }
+            start = i + 1;
+        }
+    }
+    delete buf;
+    argv.ok = true;
+    return argv;
+}
+
+// --- directory listing via popen (fs::std has no readdir listing) ---------
+#[llvm_name="popen"]
+@define blog_popen(command: string, mode: string) <&void>;
+
+#[llvm_name="fgets"]
+@define blog_fgets(buf: &char, size: int, stream: &void) <&char>;
+
+#[llvm_name="pclose"]
+@define blog_pclose(stream: &void) <int>;
+
+const MAX_POSTS <int> = 256;
+const MAX_FILES <int> = 4096;
+
+struct FileList { files <[string]>, count <int> }
+
+// Lists *.md entries in `dir` (flat, no recursion). A single quote in the
+// directory name is rejected outright so the popen command line cannot be
+// injected through. Returns count 0 on any failure (message printed).
+fun list_md_files(dir: string) <FileList> {
+    let out <FileList> = FileList{ files: new [string, MAX_FILES]{}, count: 0 };
+    if (contains(dir, "'")) {
+        printf("error: directory name may not contain a single quote: %s\n", dir);
+        return out;
+    }
+    let cmd <string> = concat(concat("ls -1 -- '", dir), "'");
+    let pipe <&void> = blog_popen(cmd, "r");
+    if (pipe == null) {
+        printf("error: could not list directory %s\n", dir);
+        return out;
+    }
+    let linebuf <[char]> = new [char, 1024]{};
+    while (out.count < MAX_FILES) {
+        let got <&char> = blog_fgets(&linebuf[0], 1024, pipe);
+        if (got == null) { break; }
+        let n <int> = 0;
+        while (n < 1024 && linebuf[n] != cast<char>(0) && linebuf[n] != cast<char>(10)) {
+            n = n + 1;
+        }
+        if (n == 0) { continue; }
+        let name <string> = from_chars(linebuf, 0, n);
+        if (ends_with(name, ".md")) {
+            out.files[out.count] = name;
+            out.count = out.count + 1;
+        } else {
+            free_str(name);
+        }
+    }
+    delete linebuf;
+    blog_pclose(pipe);
+    return out;
+}
+
+// --- front matter (same grammar as fin-ssg) --------------------------------
+struct PageMeta { title <string>, date <string>, body <string> }
+
+// Splits "---\ntitle: ..\ndate: ..\n---\n<body>" into its parts. No opening
+// fence, or no closing fence, means "no front matter": the whole text is
+// the body and the title falls back to `fallback_title`.
+fun parse_front_matter(text: string, fallback_title: string) <PageMeta> {
+    let meta <PageMeta> = PageMeta{ title: fallback_title, date: "", body: text };
+    if (!starts_with(text, "---\n")) { return meta; }
+    let rest <string> = substr(text, 4, len(text) - 4);
+    let total <int> = len(rest);
+    let fm <string> = "";
+    let closed <bool> = false;
+    let body_start <int> = total;
+    let i <int> = 0;
+    while (i < total) {
+        let nl <int> = index_of_char(substr(rest, i, total - i), '\n');
+        let line_end <int> = total;
+        if (nl >= 0) { line_end = i + nl; }
+        let line <string> = trim(substr(rest, i, line_end - i));
+        if (equals(line, "---")) {
+            closed = true;
+            if (nl >= 0) { body_start = line_end + 1; }
+            break;
+        }
+        fm = concat(fm, concat(line, "\n"));
+        if (nl < 0) { break; }
+        i = line_end + 1;
+    }
+    if (!closed) { return meta; }
+    let f <string> = fm;
+    while (true) {
+        let nl2 <int> = index_of_char(f, '\n');
+        if (nl2 < 0) { break; }
+        let fl <string> = substr(f, 0, nl2);
+        f = substr(f, nl2 + 1, len(f) - nl2 - 1);
+        let colon <int> = index_of_char(fl, ':');
+        if (colon > 0) {
+            let key <string> = trim(substr(fl, 0, colon));
+            let val <string> = trim(substr(fl, colon + 1, len(fl) - colon - 1));
+            if (equals(key, "title")) { meta.title = val; }
+            if (equals(key, "date")) { meta.date = val; }
+        }
+    }
+    meta.body = substr(rest, body_start, total - body_start);
+    return meta;
+}
+
+// "hello.md" -> "hello" (the .md suffix is the only thing stripped;
+// filenames are otherwise used verbatim, so keep them URL-safe).
+fun slug_of(filename: string) <string> {
+    if (ends_with(filename, ".md")) {
+        return substr(filename, 0, len(filename) - 3);
+    }
+    return filename;
+}
+
+// --- blog state -------------------------------------------------------------
+struct Post { slug <string>, title <string>, date <string>, html <string> }
+
+struct Blog {
+    posts <[Post]>,
+    count <int>,
+    layout <string>,
+    site_title <string>,
+    content_dir <string>
+}
+
+fun default_layout() <string> {
+    // clone: callers free_str the layout when a layout file replaces it,
+    // and freeing a string literal would abort — so this must be heap.
+    return clone("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>{{title}} &mdash; {{site_title}}</title>\n<style>body{max-width:42rem;margin:2rem auto;padding:0 1rem;font-family:system-ui,sans-serif;line-height:1.6}pre{background:#f4f4f4;padding:1rem;overflow:auto}code{background:#f4f4f4;padding:.1rem .3rem}pre code{background:none;padding:0}img{max-width:100%}blockquote{border-left:3px solid #ccc;margin-left:0;padding-left:1rem;color:#555}.date{color:#777}</style>\n</head>\n<body>\n<nav><a href=\"/\">&larr; Home</a></nav>\n<main>\n{{content}}\n</main>\n</body>\n</html>\n");
+}
+
+// Loads all posts at startup; renders each body to HTML exactly once.
+// Sorts newest-first by date string (ISO dates sort lexicographically);
+// undated posts sink to the end, in directory order.
+fun load_blog(content_dir: string, site_title: string) <Blog> {
+    let blog <Blog> = Blog{
+        posts: new [Post, MAX_POSTS]{}, count: 0,
+        layout: default_layout(), site_title: site_title,
+        content_dir: content_dir
+    };
+    let layout_path <string> = concat(concat(content_dir, "/"), "layout.html");
+    if (is_file(layout_path)) {
+        let raw? <string> = read_to_string(layout_path);
+        if (raw != null) {
+            let layout_text <string> = raw?;
+            // Clone: layout_text aliases raw's buffer, which
+            // free_file_content releases — the stored layout must own
+            // its own copy to survive past startup.
+            free_str(blog.layout);
+            blog.layout = clone(layout_text);
+            free_file_content(raw);
+        }
+    }
+    let posts_dir <string> = concat(concat(content_dir, "/"), "posts");
+    let files <FileList> = list_md_files(posts_dir);
+    for (let i <int> = 0; i < files.count; i++) {
+        if (blog.count >= MAX_POSTS) { break; }
+        let name <string> = files.files[i];
+        let src <string> = concat(concat(concat(posts_dir, "/"), name), "");
+        let raw? <string> = read_to_string(src);
+        if (raw == null) {
+            printf("warn: skipping unreadable post %s\n", src);
+            continue;
+        }
+        let text <string> = raw?;
+        let slug <string> = slug_of(name);
+        let meta <PageMeta> = parse_front_matter(text, slug);
+        let html_body <string> = md_to_html(meta.body);
+        blog.posts[blog.count] = Post{
+            slug: slug, title: meta.title, date: meta.date, html: html_body
+        };
+        blog.count = blog.count + 1;
+        free_file_content(raw);
+    }
+    // Bubble sort, newest first; empty dates compare below every real date
+    // because "" < any non-empty string, so they sink naturally.
+    for (let a <int> = 0; a < blog.count; a++) {
+        for (let b <int> = a + 1; b < blog.count; b++) {
+            if (compare(blog.posts[a].date, blog.posts[b].date) < 0) {
+                let tmp <Post> = blog.posts[a];
+                blog.posts[a] = blog.posts[b];
+                blog.posts[b] = tmp;
+            }
+        }
+    }
+    return blog;
+}
+
+fun find_post(blog: &Blog, slug: string) <int> {
+    for (let i <int> = 0; i < blog.count; i++) {
+        if (equals(blog.posts[i].slug, slug)) { return i; }
+    }
+    return -1;
+}
+
+// --- responses --------------------------------------------------------------
+// http_response_with_type clones the body, so callers free theirs after.
+fun respond_html(status: int, body: string) <&HttpResponse> {
+    let r <&HttpResponse> = http_response_with_type(status, "text/html; charset=utf-8", body);
+    free_str(body);
+    return r;
+}
+
+fun respond_json(status: int, body: string) <&HttpResponse> {
+    let r <&HttpResponse> = http_response_with_type(status, "application/json", body);
+    free_str(body);
+    return r;
+}
+
+fun not_found_html(blog: &Blog) <&HttpResponse> {
+    let body <string> = concat("<h1>404 &mdash; Not found</h1>\n<p>The page you asked for does not exist. <a href=\"/\">Back to the index</a>.</p>\n", "");
+    let page <string> = tpl_render(blog.layout, blog.site_title, "Not found", "", body);
+    free_str(body);
+    return respond_html(404, page);
+}
+
+fun index_html(blog: &Blog) <string> {
+    let items <string> = "";
+    for (let i <int> = 0; i < blog.count; i++) {
+        let p <Post> = blog.posts[i];
+        let li <string> = concat("<li><a href=\"/post/", concat(p.slug, concat("\">", concat(md_escape_html(p.title), "</a>"))));
+        if (!equals(p.date, "")) {
+            li = concat(li, concat(" <span class=\"date\">", concat(md_escape_html(p.date), "</span>")));
+        }
+        items = concat(items, concat(li, "</li>\n"));
+    }
+    let body <string> = concat(concat("<h1>", md_escape_html(blog.site_title)), concat("</h1>\n<ul>\n", concat(items, "</ul>\n")));
+    free_str(items);
+    let page <string> = tpl_render(blog.layout, blog.site_title, blog.site_title, "", body);
+    free_str(body);
+    return page;
+}
+
+fun post_html(blog: &Blog, idx: int) <string> {
+    let p <Post> = blog.posts[idx];
+    // Built purely from concat (fresh strings throughout) — no aliasing,
+    // so the single free_str(body) below is exactly one free.
+    let body <string> = concat(concat("<h1>", md_escape_html(p.title)), "</h1>\n");
+    if (!equals(p.date, "")) {
+        body = concat(body, concat("<p class=\"date\">", concat(md_escape_html(p.date), "</p>\n")));
+    }
+    body = concat(body, p.html);
+    // tpl_render auto-escapes title/date and passes content through |safe,
+    // so raw titles/dates go in and the pre-rendered HTML body stays raw.
+    let page <string> = tpl_render(blog.layout, blog.site_title, p.title, p.date, body);
+    free_str(body);
+    return page;
+}
+
+fun posts_json(blog: &Blog) <string> {
+    let arr <&JsonValue> = json_array();
+    for (let i <int> = 0; i < blog.count; i++) {
+        let obj <&JsonValue> = json_object();
+        json_object_set(obj, "slug", json_str(blog.posts[i].slug));
+        json_object_set(obj, "title", json_str(blog.posts[i].title));
+        json_object_set(obj, "date", json_str(blog.posts[i].date));
+        json_array_push(arr, obj);
+    }
+    let s <string> = json_stringify(arr);
+    json_free(arr);
+    return s;
+}
+
+// --- routing ----------------------------------------------------------------
+// Path with any "?query" stripped.
+fun strip_query(target: string) <string> {
+    let q <int> = find(target, "?");
+    if (q < 0) { return target; }
+    return substr(target, 0, q);
+}
+
+// Segment after a prefix, or "" when the path is not exactly prefix + one
+// clean segment (no nested slashes, no empty segment).
+fun single_segment(path: string, prefix: string) <string> {
+    if (!starts_with(path, prefix)) { return ""; }
+    let seg <string> = substr(path, len(prefix), len(path) - len(prefix));
+    if (equals(seg, "")) { return ""; }
+    if (find(seg, "/") >= 0) { return ""; }
+    return seg;
+}
+
+fun static_type(name: string) <string> {
+    if (ends_with(name, ".css")) { return "text/css; charset=utf-8"; }
+    if (ends_with(name, ".js")) { return "text/javascript; charset=utf-8"; }
+    if (ends_with(name, ".html")) { return "text/html; charset=utf-8"; }
+    if (ends_with(name, ".txt")) { return "text/plain; charset=utf-8"; }
+    return "";
+}
+
+fun handle(blog: &Blog, req: &HttpRequest) <&HttpResponse> {
+    if (!equals(req.method, "GET")) {
+        let page <string> = tpl_render(blog.layout, blog.site_title, "Method not allowed", "", "<h1>405 &mdash; Method not allowed</h1>\n<p>This blog only serves GET requests.</p>\n");
+        return respond_html(405, page);
+    }
+    let path <string> = strip_query(req.target);
+    if (equals(path, "/")) {
+        return respond_html(200, index_html(blog));
+    }
+    if (equals(path, "/api/posts")) {
+        return respond_json(200, posts_json(blog));
+    }
+    if (starts_with(path, "/api/")) {
+        let obj <&JsonValue> = json_object();
+        json_object_set(obj, "error", json_str("not found"));
+        let s <string> = json_stringify(obj);
+        json_free(obj);
+        return respond_json(404, s);
+    }
+    if (starts_with(path, "/post/")) {
+        let slug <string> = single_segment(path, "/post/");
+        if (equals(slug, "")) { return not_found_html(blog); }
+        let idx <int> = find_post(blog, slug);
+        if (idx < 0) { return not_found_html(blog); }
+        return respond_html(200, post_html(blog, idx));
+    }
+    if (starts_with(path, "/static/")) {
+        let name <string> = single_segment(path, "/static/");
+        let ctype <string> = static_type(name);
+        if (equals(name, "") || equals(ctype, "")) { return not_found_html(blog); }
+        let fpath <string> = concat(concat(concat(blog.content_dir, "/static/"), name), "");
+        if (!is_file(fpath)) { return not_found_html(blog); }
+        let raw? <string> = read_to_string(fpath);
+        if (raw == null) { return not_found_html(blog); }
+        let text <string> = raw?;
+        let r <&HttpResponse> = http_response_with_type(200, ctype, text);
+        free_file_content(raw);
+        return r;
+    }
+    return not_found_html(blog);
+}
+
+fun main() <noret> {
+    let argv <Argv> = read_argv();
+    let content_dir <string> = "content";
+    if (argv.count >= 1) { content_dir = argv.args[0]; }
+    let port <int> = 8080;
+    if (argv.count >= 2 && is_numeric(argv.args[1]) && len(argv.args[1]) <= 5) {
+        port = parse_int(argv.args[1]);
+    }
+    let site_title <string> = "My Fin Blog";
+    if (argv.count >= 3) { site_title = argv.args[2]; }
+    if (!is_dir(content_dir)) {
+        printf("error: content directory not found: %s\n", content_dir);
+        return;
+    }
+    let blog <Blog> = load_blog(content_dir, site_title);
+    printf("fin-blog: %d post(s) from %s\n", blog.count, content_dir);
+    let srv <&HttpServer> = http_listen(port);
+    printf("fin-blog on http://127.0.0.1:%d/ (Ctrl-C to stop)\n", http_server_port(srv));
+    while (true) {
+        let conn <&HttpConn> = http_accept(srv);
+        let rr <HttpReadResult> = http_read_request(conn);
+        if (rr.ok) {
+            let resp <&HttpResponse> = handle(&blog, rr.req);
+            http_write_response(conn, resp);
+            http_free_response(resp);
+            http_free_read_result(&rr);
+        } else {
+            let resp <&HttpResponse> = not_found_html(&blog);
+            http_write_response(conn, resp);
+            http_free_response(resp);
+            http_free_read_result(&rr);
+        }
+        http_close(conn);
+    }
+    http_server_close(srv);
+}

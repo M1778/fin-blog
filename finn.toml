@@ -1,0 +1,18 @@
+# finn.toml — REAL format per github.com/M1778/finn (README, 2026-10-19).
+[project]
+name = "fin-blog"
+version = "0.1.0"
+envpath = ".finn"
+entrypoint = "main.fin"
+
+[registry]
+
+[packages]
+# Until finn publishes them, the four libraries are sibling checkouts
+# passed to finc with -I (see README.md): zhttp, fin-template,
+# fin-markdown, finson.
+
+[scripts]
+check = "finc -I <zhttp>/src -I <fin-template>/src -I <fin-markdown>/src -I <finson>/src src/main.fin"
+test = "python3 tests/smoke.py"
+demo = "sh examples/demo.sh"
